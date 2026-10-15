@@ -1,0 +1,125 @@
+[[bench]]
+name = "ticket by summons number"
+mode = "index"
+pick = """
+select summons_number
+from core.violations
+order by summons_number
+offset (select count(*) / 3 from core.violations)
+limit 1
+"""
+sql = "select * from core.violations where summons_number = %(summons_number)s"
+
+[[bench]]
+name = "ticket history of one plate"
+mode = "index"
+pick = """
+select v.plate_id, v.state_code
+from mart.vehicle_activity a
+join core.vehicles v on v.vehicle_id = a.vehicle_id
+order by abs(a.tickets - 12), a.vehicle_id
+limit 1
+"""
+sql = "select * from core.plate_history(%(plate_id)s, %(state_code)s)"
+
+[[bench]]
+name = "one day of tickets by code"
+mode = "index"
+pick = "select min(issue_date) + (max(issue_date) - min(issue_date)) / 2 as issue_date from core.violations"
+sql = """
+select violation_code, count(*)
+from core.violations
+where issue_date = %(issue_date)s
+group by violation_code
+"""
+
+[[bench]]
+name = "hydrant tickets in one month"
+mode = "index"
+pick = "select min(issue_date) + 120 as day_from, min(issue_date) + 150 as day_to from core.violations"
+sql = """
+select count(*), count(distinct vehicle_id)
+from core.violations
+where violation_code = 40 and issue_date between %(day_from)s and %(day_to)s
+"""
+
+[[bench]]
+name = "hydrant tickets in one precinct"
+mode = "index"
+pick = """
+select precinct_id
+from core.precincts
+order by precinct_id
+offset (select count(*) / 2 from core.precincts)
+limit 1
+"""
+sql = "select count(*) from core.violations where violation_code = 40 and precinct_id = %(precinct_id)s"
+
+[[bench]]
+name = "partial plate search"
+mode = "index"
+pick = """
+select substr(plate_id, 2, 4) as fragment
+from core.vehicles
+where length(plate_id) >= 7
+order by vehicle_id
+limit 1
+"""
+sql = "select plate_id, state_code from core.vehicles where plate_id like '%%' || %(fragment)s || '%%'"
+
+[[bench]]
+name = "street name search"
+mode = "index"
+pick = "select 'NOSTRAN' as fragment"
+sql = "select borough_id, street_name from core.streets where street_name like '%%' || %(fragment)s || '%%'"
+
+[[bench]]
+name = "one month count"
+mode = "pruning"
+pick = """
+select date_trunc('month', min(issue_date) + 200)::date as month_start,
+       (date_trunc('month', min(issue_date) + 200) + interval '1 month')::date as month_end
+from core.violations
+"""
+sql = "select count(*) from core.violations where issue_date >= %(month_start)s and issue_date < %(month_end)s"
+
+[[bench]]
+name = "monthly tickets per borough"
+mode = "pair"
+sql = """
+select b.borough_name, date_trunc('month', v.issue_date) as month, count(*)
+from core.violations v
+left join core.streets s on s.street_id = v.street_id
+left join core.boroughs b on b.borough_id = s.borough_id
+group by 1, 2
+"""
+sql_b = """
+select b.borough_name, date_trunc('month', d.issue_date) as month, sum(d.tickets)
+from mart.daily_tickets d
+left join core.boroughs b on b.borough_id = d.borough_id
+group by 1, 2
+"""
+
+[[bench]]
+name = "page 50,001 of all tickets"
+mode = "pair"
+pick = """
+select summons_number as after
+from core.violations
+order by summons_number
+offset (select least(999999, count(*) / 2) from core.violations)
+limit 1
+"""
+sql = """
+select summons_number, issue_date, violation_code
+from core.violations
+order by summons_number
+offset 1000000 limit 20
+"""
+sql_b = """
+select summons_number, issue_date, violation_code
+from core.violations
+where summons_number > %(after)s
+order by summons_number
+limit 20
+"""

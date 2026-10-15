@@ -1,0 +1,31 @@
+[database]
+host = "localhost"
+port = 5432
+dbname = "curbside"
+user = "postgres"
+
+[data]
+dir = "data"
+base_url = "https://data.cityofnewyork.us/api/v3/views"
+violations_dataset = "9mwx-gamw"
+codes_dataset = "ncbg-6agr"
+fiscal_year = 2026
+late_months = 1
+
+[load]
+chunk_kb = 1024
+
+[build]
+work_mem = "256MB"
+maintenance_work_mem = "512MB"
+effective_cache_size = "1GB"
+parallel_workers = 2
+profile_sample_percent = 2.0
+make_match_distance = 1
+make_match_prefix = 3
+make_match_ratio = 200
+min_precinct_tickets = 100
+precinct_majority = 0.9
+
+[bench]
+repeats = 5
