@@ -1,6 +1,6 @@
 # curbside
 
-I wanted to get good at SQL on data that is too big to check by eye. So I took one fiscal year of New York City parking tickets, 15.7 million rows of messy public CSV, and turned it into a clean PostgreSQL database with keys, constraints, indexes and checks that prove no row went missing.
+I took one fiscal year of New York City parking tickets, 15.7 million rows of messy public CSV, and turned it into a clean PostgreSQL database with keys, constraints, indexes and checks that prove no row went missing.
 
 Every number in this README was measured on my laptop, an HP OmniBook 5 (Intel Core 5 120U, 8 GB RAM, Windows 11) running PostgreSQL 16.15.
 
@@ -34,10 +34,10 @@ python -m curbside erd
 
 `load` copies the CSV into the raw schema exactly as it is, in one transaction with COPY FREEZE. On my laptop that takes 251.1 seconds for all 15,691,604 rows. `build` then runs the files in `sql/` in order, and each file commits on its own.
 
-| file | what it does | time on my laptop |
+| step | what it does | time on my laptop |
 |---|---|---|
 | 02_etl.sql | schemas, extensions and the parsing functions | 0.9 s |
-| 03_profile.sql | blank, zero and distinct counts for every raw column | 209 s |
+| 03_profile.sql | blank and zero counts for every raw column, plus distinct counts on a 2% sample | 209 s |
 | 04_reference.sql | lookup tables and the maps for states, plate types, agencies, makes, colors and body types | 176 s |
 | 05_stage.sql | parses every raw value once and marks the rows it has to reject | 836 s |
 | 06_core.sql | vehicles, issuers, precincts and streets | 746 s |
@@ -46,6 +46,7 @@ python -m curbside erd
 | 09_quality.sql | rejects, null counts and the 8 checks | 283 s |
 | 10_marts.sql | a detail view and two materialized views | 92 s |
 | 11_features.sql | an audit trigger, a function, a reload procedure and two roles | 0.3 s |
+| vacuum | updates the visibility map so index-only scans can skip the table | 7.3 s |
 
 All together the build took 60.7 minutes, and most of that goes to the three files that touch every ticket (05, 06 and 07). The data ends up in five schemas.
 
@@ -183,9 +184,9 @@ erDiagram
 
 ## Cleaning
 
-Parsing. `05_stage.sql` reads the raw table once and parses every value into `etl.stage_violations`. The parsing functions are small SQL functions that return NULL instead of raising an error, so one bad value can't stop the build. They check characters with `translate()` instead of regular expressions. Since they are plain SQL functions, Postgres can inline them, and they are marked PARALLEL SAFE so the big CREATE TABLE AS can use parallel workers.
+Parsing. `05_stage.sql` parses every raw value once into `etl.stage_violations`. The parsing functions are small SQL functions that return NULL instead of raising an error, so one bad value can't stop the build. They check characters with `translate()` instead of regular expressions. Since they are plain SQL functions, Postgres can inline them, and they are marked PARALLEL SAFE so the big CREATE TABLE AS can use parallel workers.
 
-Rejects. A row is only rejected when it can't be a real ticket. 10,801 rows (0.07%) were rejected, and every one is kept in `quality.rejects` with its reason.
+Rejects. A row is only rejected when it can't be a clean ticket for this fiscal year. 10,801 rows (0.07%) were rejected, and every one is kept in `quality.rejects` with its reason.
 
 | reason | rows |
 |---|---|
@@ -204,7 +205,7 @@ Streets. Handheld tickets have 48,546 street spellings. `normalize_street()` upp
 
 Camera locations. 6,713,347 camera tickets keep their location in the two street columns, cut at 20 characters, and there are 9,948 different pairs. To glue them back I built a vocabulary of street words from the handheld tickets and wrote 13 rules that run in order. Digits on both sides of the cut get joined, so "WB N CONDUIT AVE @ 8" plus "8TH ST" becomes 88TH ST. Two halves that only make a known word together get joined too, so MER plus RICK becomes MERRICK. If the first half is shorter than 20 characters, the cut was at a space. Then the location is split at the @ into the street and the cross street.
 
-Precincts. A precinct gets a borough only if it has at least 100 tickets and at least 90% of them are in one borough. 78 precincts pass.
+Precincts. A precinct is only kept if it has at least 100 tickets with a known borough and at least 90% of them are in one borough. 78 precincts pass, and tickets from the rest get no precinct.
 
 What I could not match is counted, not hidden. `quality.unmatched_values` has 86,688 rows with a plate type that is not in the list, 52,067 with an unknown registration state, 1,235 with an unknown precinct and 507 with an unknown county. Those values are NULL in core, but the tickets stay.
 
@@ -252,7 +253,7 @@ These come from the queries in `queries/`.
 
 ## Things that went wrong
 
-The load got slower and slower on Windows. The first full load on my laptop took 2,013.6 seconds. `pg_stat_progress_copy` showed the server sitting in ClientRead, waiting for data, while Python used a whole CPU core. The driver kept handing 1 MB chunks to libpq faster than the Windows socket could send them, so libpq kept growing its send buffer and moving the leftover bytes on every send. `db.drain()` now waits for the buffer to empty after every chunk, and the same load takes 251.1 seconds.
+The load got slower and slower on Windows. The first full load on my laptop took 2,013.6 seconds. Near the end `pg_stat_progress_copy` showed only about 3,000 rows a second coming in, and `pg_stat_activity` showed the server waiting on ClientRead while Python used a whole CPU core. The driver kept handing 1 MB chunks to libpq faster than the Windows socket could send them, so libpq kept growing its send buffer and moving the leftover bytes on every send. `db.drain()` now waits for the buffer to empty after every chunk, and the same load takes 251.1 seconds.
 
 Postgres picked the wrong plan for 8 GB of RAM. In my first full build, `10_marts.sql` was still running after 20 minutes. EXPLAIN showed that `mart.vehicle_activity` was reading the ticket table through the `(vehicle_id, issue_date)` index on all 13 partitions instead of reading it once and sorting. That plan is good when the table is cached, and the default `effective_cache_size` of 4GB told Postgres it would be. My laptop had about 1 GB free, so it was reading pages from disk at random. With `effective_cache_size = "1GB"` in `config.toml`, Postgres picks a full scan plus a sort and the file finishes in 92 seconds. I also added `build --from` so I could resume at that file instead of starting over.
 
@@ -272,24 +273,26 @@ call core.reload_month('2026-03-01');
 
 ## Running it
 
-You need Python 3.11 or newer and PostgreSQL 16. The pg_trgm and fuzzystrmatch extensions come with the normal PostgreSQL installers. The finished database is about 10 GB, so plan for around 15 GB of free disk.
+You need Python 3.11 or newer and PostgreSQL 16. The pg_trgm and fuzzystrmatch extensions come with the normal PostgreSQL installers (on Fedora or RHEL, also install postgresql16-contrib). The finished database is about 10 GB, so plan for around 15 GB of free disk.
+
+Connection settings and every tuning knob are in `config.toml`. The password is not, so put it in a pgpass file or set the PGPASSWORD environment variable before you start.
 
 ```
 git clone https://github.com/adwitiyashukla/curbside.git
 cd curbside
 python -m venv .venv
 .venv\Scripts\activate
-pip install -e .[dev]
-createdb -U postgres -E UTF8 -T template0 curbside
+pip install -e ".[dev]"
+createdb -h localhost -U postgres -E UTF8 -T template0 curbside
 python -m curbside download
 python -m curbside load
 python -m curbside build
 python -m curbside bench
 ```
 
-On Linux or macOS, activate with `source .venv/bin/activate`. Connection settings and every tuning knob are in `config.toml`. The password is not, so put it in a pgpass file or the PGPASSWORD environment variable. If a build stops partway, `python -m curbside build --from 10_marts.sql` picks it up at that file.
+On Windows, `createdb` is in PostgreSQL's bin folder (for example C:\Program Files\PostgreSQL\16\bin), so use the full path if that folder is not on your PATH. On Linux or macOS, create the venv with `python3` and activate it with `source .venv/bin/activate`. If a build stops partway, `python -m curbside build --from 10_marts.sql` picks it up at that file.
 
-`pytest` runs the whole pipeline on 2,806 real rows plus a few broken ones I made on purpose, in a separate `curbside_test` database. The 81 tests take about 19 seconds on my laptop. GitHub Actions runs ruff and pytest on Python 3.11, 3.12 and 3.13 against a postgres:16 container.
+`pytest` runs the whole pipeline on 2,803 real rows plus 3 broken ones I made on purpose, in a separate `curbside_test` database. The 81 tests take about 19 seconds on my laptop. GitHub Actions runs ruff and pytest on Python 3.11, 3.12 and 3.13 against a postgres:16 container.
 
 ## Layout
 
